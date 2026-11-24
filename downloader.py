@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import json
+import base64
+from contextlib import contextmanager
 import mimetypes
 import os
 import re
@@ -232,6 +234,52 @@ def ydl_base_opts():
     return opts
 
 
+@contextmanager
+def platform_session(url, opts):
+    """Use only an explicitly configured, platform-specific session."""
+    source = detect_source(url)
+    prefix = 'YOUTUBE' if source in ('youtube', 'youtube_shorts') else 'TIKTOK' if source == 'tiktok' else None
+    with tempfile.TemporaryDirectory(prefix='nocturne_auth_') as folder:
+        value = os.getenv(prefix + '_COOKIES_B64', '') if prefix else ''
+        if value:
+            try:
+                raw = base64.b64decode(value.strip(), validate=True).decode('utf-8-sig')
+                if not raw.startswith(('# Netscape HTTP Cookie File', '# HTTP Cookie File')):
+                    raise ValueError()
+                # Do not import unrelated browser sessions.
+                domains = ('youtube.com', 'google.com') if prefix == 'YOUTUBE' else ('tiktok.com',)
+                lines = ['# Netscape HTTP Cookie File']
+                for line in raw.splitlines():
+                    entry = line.removeprefix('#HttpOnly_')
+                    if not entry or entry.startswith('#'): continue
+                    fields = entry.split('\t')
+                    if len(fields) != 7: raise ValueError()
+                    host = fields[0].lstrip('.').lower()
+                    if any(host == d or host.endswith('.'+d) for d in domains): lines.append(line)
+                if len(lines) == 1: raise ValueError()
+                cookiefile = Path(folder) / 'cookies.txt'
+                cookiefile.write_text('\n'.join(lines)+'\n', encoding='utf-8')
+                cookiefile.chmod(0o600)
+                opts = dict(opts, cookiefile=str(cookiefile))
+            except Exception:
+                raise ValueError('Некорректный файл авторизации для '+prefix) from None
+        with yt_dlp_module().YoutubeDL(opts) as ydl:
+            yield ydl
+
+
+def public_error(exc, url):
+    text = str(exc).lower()
+    source = detect_source(url)
+    if 'файл авторизации' in text:
+        return 'Ошибка настройки авторизации. Сообщи администратору.'
+    if any(x in text for x in ('sign in to confirm', 'not a bot', 'ip address is blocked', '403', 'forbidden')):
+        name = 'YouTube' if source.startswith('youtube') else 'TikTok' if source == 'tiktok' else 'Источник'
+        return name + ' отклонил запрос сервера (403 или требуется авторизация). Попробуй позже или отправь исходный видеофайл, на который у тебя есть права.'
+    if 'лимит' in text or 'max-filesize' in text:
+        return 'Файл превышает лимит. Выбери качество ниже.'
+    return 'Не удалось получить видео. Проверь доступность ссылки или отправь исходный файл.'
+
+
 def normalize_info(info):
     if not isinstance(info, dict):
         raise ValueError("Источник не вернул данные о видео.")
@@ -246,7 +294,7 @@ def normalize_info(info):
 def extract_platform_info(url):
     yt_dlp = yt_dlp_module()
     opts = ydl_base_opts()
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with platform_session(url, opts) as ydl:
         return normalize_info(ydl.extract_info(url, download=False))
 
 
@@ -536,7 +584,7 @@ def download_platform_to(job_id, url, quality, folder):
     selector = quality_selector(quality)
     if source == "tiktok":
         probe_opts = ydl_base_opts()
-        with yt_dlp.YoutubeDL(probe_opts) as probe:
+        with platform_session(url, probe_opts) as probe:
             probe_info = normalize_info(probe.extract_info(url, download=False))
         selector = choose_tiktok_format(probe_info, quality)
     opts = ydl_base_opts()
@@ -551,7 +599,7 @@ def download_platform_to(job_id, url, quality, folder):
     if find_ffmpeg():
         opts["merge_output_format"] = "mp4"
     update_job(job_id, status="downloading", progress=2, message="Получаю выбранный формат…")
-    with yt_dlp.YoutubeDL(opts) as ydl:
+    with platform_session(url, opts) as ydl:
         info = normalize_info(ydl.extract_info(url, download=True))
     path = pick_downloaded_file(folder)
     title = sanitize_filename(info.get("title") or "video", "video")
@@ -633,7 +681,7 @@ def run_download_job(job_id, url, quality):
             raise ValueError("Файл превышает лимит. Выбери качество ниже.")
         update_job(job_id, status="ready", progress=100, message="Файл готов.", path=str(path), filename=filename, size=size)
     except Exception as exc:
-        update_job(job_id, status="error", progress=0, message=str(exc))
+        update_job(job_id, status="error", progress=0, message=public_error(exc, url))
 
 
 def cleanup_jobs():
